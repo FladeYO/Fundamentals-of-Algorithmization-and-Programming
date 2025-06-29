@@ -1,267 +1,202 @@
+#define NOMINMAX
 #include <Windows.h>
 #include <cmath>
 #include <vector>
 #include <string>
 #include <ctime>
-#include <algorithm>
 #include <thread>
 #include <mutex>
-#include <sstream>
-#include <iomanip>
+#include <random>
 
 #pragma comment(linker, "/SUBSYSTEM:WINDOWS")
 #pragma comment(lib, "kernel32.lib")
 #pragma comment(lib, "user32.lib")
 #pragma comment(lib, "gdi32.lib")
 
-constexpr int WINDOW_WIDTH = 1200;
-constexpr int WINDOW_HEIGHT = 900;
-constexpr float P = 400.0f;
-constexpr float MISSILE_SPEED = 50.0f;
-constexpr float ROTATION_SPEED = 45.0f * 1.5f;  // 67.5 градусов/сек
-constexpr float DETECTION_RADIUS = (P / 3.0f) * 3.0f;  // = P
-constexpr float DESTRUCTION_RADIUS = (DETECTION_RADIUS / 2.0f) * 1.5f;
-constexpr int TOTAL_MISSILES = 10;  // Ровно 10 ракет
-constexpr float BEAM_WIDTH_DEG = 15.0f;  // Ширина луча в градусах
+// Конфигурация
+const int WINDOW_WIDTH = 1200;
+const int WINDOW_HEIGHT = 900;
+const float FIELD_SIZE = 400.0f;
+const float MISSILE_SPEED = 30.0f;  // Замедленная скорость ракет
+const float RADAR_SPEED = 80.0f;    // Оптимизированная скорость радара
+const float DETECTION_RADIUS = FIELD_SIZE;
+const float DESTRUCTION_RADIUS = FIELD_SIZE * 0.75f;
+const int TOTAL_MISSILES = 10;
+const float BEAM_WIDTH = 20.0f;     // Немного шире луч для улучшения попаданий
 
-const COLORREF DARK_BG = RGB(30, 30, 40);
-const COLORREF LIGHT_TEXT = RGB(220, 220, 220);
-const COLORREF SQUARE_COLOR = RGB(200, 30, 20);
+// Цвета
+const COLORREF BG_COLOR = RGB(30, 30, 40);
+const COLORREF TEXT_COLOR = RGB(220, 220, 220);
+const COLORREF SQUARE_COLOR = RGB(180, 180, 200);
 const COLORREF DETECTION_COLOR = RGB(100, 150, 255);
-const COLORREF DESTRUCTION_COLOR = RGB(132, 132, 130);
-const COLORREF RADAR_BEAM = RGB(100, 255, 100);
-const COLORREF BEAM_FILL = RGB(100, 255, 100);
-const COLORREF MISSILE_NORMAL = RGB(255, 200, 50);
-const COLORREF MISSILE_DETECTED = RGB(255, 10, 50);
-const COLORREF MISSILE_DESTROYED = RGB(150, 150, 150);
+const COLORREF DESTRUCTION_COLOR = RGB(255, 100, 100);
+const COLORREF BEAM_COLOR = RGB(100, 255, 100);
+const COLORREF MISSILE_COLOR = RGB(255, 200, 50);
+const COLORREF DETECTED_MISSILE_COLOR = RGB(255, 100, 50);
+const COLORREF DESTROYED_MISSILE_COLOR = RGB(150, 150, 150);
 
-std::mutex dataMutex;
+std::mutex data_mutex;
+std::mt19937 rng;
 
-// Функция для проверки, находится ли точка внутри треугольника
-bool PointInTriangle(float px, float py, float ax, float ay, float bx, float by, float cx, float cy) {
+// Проверка попадания в луч
+bool InBeam(float px, float py, float ax, float ay, float bx, float by, float cx, float cy) {
     float d1 = (px - bx) * (ay - by) - (ax - bx) * (py - by);
     float d2 = (px - cx) * (by - cy) - (bx - cx) * (py - cy);
     float d3 = (px - ax) * (cy - ay) - (cx - ax) * (py - ay);
-
     bool has_neg = (d1 < 0) || (d2 < 0) || (d3 < 0);
     bool has_pos = (d1 > 0) || (d2 > 0) || (d3 > 0);
-
     return !(has_neg && has_pos);
 }
 
 class Missile {
 public:
     float x, y;
-    float startX, startY;
-    bool active;
-    bool detected;
-    bool destroyed;
-    bool hitTarget;
+    bool active, detected, destroyed, hit;
     int id;
     DWORD launchTime;
 
-    Missile(float x, float y, int id)
-        : x(x), y(y), startX(x), startY(y), active(true),
-        detected(false), destroyed(false), hitTarget(false), id(id) {
+    Missile(float sx, float sy, int id) 
+        : x(sx), y(sy), id(id), active(true), detected(false), 
+          destroyed(false), hit(false) {
         launchTime = GetTickCount();
     }
 
     void Update(float dt) {
-        if (!active || destroyed || hitTarget) return;
+        if (!active || destroyed || hit) return;
 
-        float centerX = 0.0f;
-        float centerY = 0.0f;
-        float dx = centerX - x;
-        float dy = centerY - y;
-        float length = std::sqrt(dx * dx + dy * dy);
-
-        if (length > 0) {
-            dx /= length;
-            dy /= length;
+        float dx = -x;
+        float dy = -y;
+        float len = sqrt(dx*dx + dy*dy);
+        if (len > 0) {
+            dx /= len;
+            dy /= len;
         }
 
         x += dx * MISSILE_SPEED * dt;
         y += dy * MISSILE_SPEED * dt;
 
-        if (length < 5.0f) {
-            hitTarget = true;
-        }
+        if (sqrt(x*x + y*y) < 10.0f) hit = true;
     }
 
-    float DistanceFromCenter() const {
-        float centerX = 0.0f;
-        float centerY = 0.0f;
-        float dx = x - centerX;
-        float dy = y - centerY;
-        return std::sqrt(dx * dx + dy * dy);
-    }
-
-    float AngleFromCenter() const {
-        float centerX = 0.0f;
-        float centerY = 0.0f;
-        return std::atan2(y - centerY, x - centerX) * 180.0f / 3.14159265f;
+    float Distance() const { 
+        return sqrt(x*x + y*y); 
     }
 };
 
 class Launcher {
 public:
-    float posX, posY;
-    int missilesLaunched;
-    int maxMissiles;  // Максимальное количество ракет для этой установки
-    DWORD nextLaunchTime;
-    DWORD initialDelay;
+    float x, y;
+    int launched, max_missiles;
+    DWORD next_launch_time, start_delay;
 
-    Launcher(float x, float y, int max)
-        : posX(x), posY(y), missilesLaunched(0), maxMissiles(max), nextLaunchTime(0) {
-        initialDelay = rand() % 7000;
+    Launcher(float px, float py, int max) 
+        : x(px), y(py), max_missiles(max), launched(0), next_launch_time(0) {
+        std::uniform_int_distribution<int> delay(2000, 10000);
+        start_delay = delay(rng);
     }
 
-    bool TryLaunchMissile(int& nextId) {
-        DWORD currentTime = GetTickCount();
-
-        // Если установка уже выпустила все свои ракеты
-        if (missilesLaunched >= maxMissiles) {
-            return false;
-        }
-
-        // Если это первый запуск для установки
-        if (missilesLaunched == 0) {
-            if (currentTime < initialDelay) {
-                return false;
-            }
-        }
-        // Для последующих запусков
-        else if (currentTime < nextLaunchTime) {
-            return false;
-        }
-
-        // время следующего запуска (5-8 секунд)
-        nextLaunchTime = currentTime + (5000 + rand() % 3000);
-        missilesLaunched++;
+    bool CanLaunch() const {
+        DWORD now = GetTickCount();
+        if (launched >= max_missiles) return false;
+        if (launched == 0 && now < start_delay) return false;
+        if (launched > 0 && now < next_launch_time) return false;
         return true;
+    }
+
+    void Launch() {
+        std::uniform_int_distribution<int> interval(3000, 8000);
+        next_launch_time = GetTickCount() + interval(rng);
+        launched++;
     }
 };
 
 class Radar {
 public:
-    float currentAngle;
-    float targetAngle;
-    bool lockedOn;
+    float angle;
     bool destroyed;
-    int detectedMissileId;
-    DWORD detectionTime;
 
-    Radar()
-        : currentAngle(0.0f), targetAngle(0.0f), lockedOn(false),
-        destroyed(false), detectedMissileId(-1) {
-    }
+    Radar() : angle(0.0f), destroyed(false) {}
 
     void Update(std::vector<Missile>& missiles, float dt) {
         if (destroyed) return;
-
-        // Поиск новых целей
-        if (!lockedOn) {
-            for (auto& missile : missiles) {
-                if (missile.active && !missile.detected &&
-                    missile.DistanceFromCenter() <= DETECTION_RADIUS) {
-                    detectedMissileId = missile.id;
-                    missile.detected = true;
-                    targetAngle = missile.AngleFromCenter();
-                    lockedOn = true;
-                    detectionTime = GetTickCount();
-                    break;
-                }
-            }
-        }
-
-        // Поворот к цели
-        if (lockedOn) {
-            float angleDiff = targetAngle - currentAngle;
-            if (angleDiff > 180) angleDiff -= 360;
-            if (angleDiff < -180) angleDiff += 360;
-
-            float maxRotation = ROTATION_SPEED * dt;
-            if (std::abs(angleDiff) <= maxRotation) {
-                currentAngle = targetAngle;
-            }
-            else {
-                currentAngle += (angleDiff > 0) ? maxRotation : -maxRotation;
-            }
-
-            if (currentAngle >= 360) currentAngle -= 360;
-            if (currentAngle < 0) currentAngle += 360;
-        }
-
-        // Уничтожение ракет, попавших в луч
+        
+        // Плавное вращение по часовой стрелке
+        angle += RADAR_SPEED * dt;
+        if (angle >= 360) angle -= 360;
+        
+        // Поиск целей в зоне поражения
         for (auto& missile : missiles) {
-            if (missile.active && missile.detected &&
-                missile.DistanceFromCenter() <= DESTRUCTION_RADIUS) {
-
-                // координаты луча
-                float radAngle = currentAngle * 3.14159265f / 180.0f;
-                float halfBeam = BEAM_WIDTH_DEG * 3.14159265f / 180.0f / 2.0f;
-
-                float ax = 0.0f, ay = 0.0f;  // Центр радара
-                float bx = DETECTION_RADIUS * std::cos(radAngle - halfBeam);
-                float by = DETECTION_RADIUS * std::sin(radAngle - halfBeam);
-                float cx = DETECTION_RADIUS * std::cos(radAngle + halfBeam);
-                float cy = DETECTION_RADIUS * std::sin(radAngle + halfBeam);
-
-                // попадание в треугольник
-                if (PointInTriangle(missile.x, missile.y, ax, ay, bx, by, cx, cy)) {
+            if (missile.active && !missile.detected && 
+                missile.Distance() <= DETECTION_RADIUS) {
+                missile.detected = true;
+            }
+            
+            if (missile.active && missile.detected && 
+                missile.Distance() <= DESTRUCTION_RADIUS) {
+                
+                float rad = angle * 3.14159265f / 180.0f;
+                float half_beam = BEAM_WIDTH * 3.14159265f / 360.0f;
+                
+                float cx = 0, cy = 0;
+                float lx = DETECTION_RADIUS * cos(rad - half_beam);
+                float ly = DETECTION_RADIUS * sin(rad - half_beam);
+                float rx = DETECTION_RADIUS * cos(rad + half_beam);
+                float ry = DETECTION_RADIUS * sin(rad + half_beam);
+                
+                if (InBeam(missile.x, missile.y, cx, cy, lx, ly, rx, ry)) {
                     missile.destroyed = true;
-                    // Если уничтожена текущая цель, сбрасываем фокус
-                    if (missile.id == detectedMissileId) {
-                        lockedOn = false;
-                        detectedMissileId = -1;
-                    }
                 }
             }
         }
     }
 };
 
+// Глобальные объекты
 std::vector<Missile> missiles;
 std::vector<Launcher> launchers;
 Radar radar;
-int nextMissileId = 0;
-int totalLaunched = 0;  // Общее количество запущенных ракет
-bool simulationRunning = true;
-int destroyedCount = 0;
-int hitCount = 0;
+int next_id = 0;
+int launched_count = 0;
+int destroyed_count = 0;
+int hit_count = 0;
+bool is_running = true;
 
 void SimulationThread(HWND hwnd) {
-    while (simulationRunning) {
-        float dt = 0.1f;
-
+    while (is_running) {
         {
-            std::lock_guard<std::mutex> lock(dataMutex);
-
-            // Запуск ракет максимум 10
-            if (totalLaunched < TOTAL_MISSILES) {
+            std::lock_guard<std::mutex> lock(data_mutex);
+            
+            // Запуск ракет
+            if (launched_count < TOTAL_MISSILES) {
                 for (auto& launcher : launchers) {
-                    if (launcher.TryLaunchMissile(nextMissileId)) {
-                        missiles.emplace_back(launcher.posX, launcher.posY, nextMissileId++);
-                        totalLaunched++;
-                        if (totalLaunched >= TOTAL_MISSILES) break;
+                    if (launcher.CanLaunch()) {
+                        launcher.Launch();
+                        
+                        // Случайное смещение запуска
+                        std::uniform_real_distribution<float> offset(-30.0f, 30.0f);
+                        float x = launcher.x + offset(rng);
+                        float y = launcher.y + offset(rng);
+                        
+                        missiles.emplace_back(x, y, next_id++);
+                        if (++launched_count >= TOTAL_MISSILES) break;
                     }
                 }
             }
-
-            // Обновление позиций ракет
+            
+            // Обновление ракет
             for (auto& missile : missiles) {
-                missile.Update(dt);
+                missile.Update(0.1f);
             }
-
-            // Обработка уничтоженных ракет
+            
+            // Обработка результатов
             auto it = missiles.begin();
             while (it != missiles.end()) {
                 if (it->destroyed) {
-                    destroyedCount++;
+                    destroyed_count++;
                     it = missiles.erase(it);
                 }
-                else if (it->hitTarget) {
-                    hitCount++;
+                else if (it->hit) {
+                    hit_count++;
                     radar.destroyed = true;
                     it = missiles.erase(it);
                 }
@@ -270,285 +205,203 @@ void SimulationThread(HWND hwnd) {
                 }
             }
         }
-
+        
         InvalidateRect(hwnd, NULL, FALSE);
         Sleep(100);
     }
 }
 
 void RadarThread() {
-    DWORD lastTime = GetTickCount();
-    while (simulationRunning) {
-        DWORD currentTime = GetTickCount();
-        float dt = (currentTime - lastTime) / 1000.0f;
-        lastTime = currentTime;
-
+    DWORD last_time = GetTickCount();
+    
+    while (is_running) {
+        DWORD current_time = GetTickCount();
+        float delta_time = (current_time - last_time) / 1000.0f;
+        last_time = current_time;
+        
         {
-            std::lock_guard<std::mutex> lock(dataMutex);
-            radar.Update(missiles, dt);
+            std::lock_guard<std::mutex> lock(data_mutex);
+            radar.Update(missiles, delta_time);
         }
-
+        
         Sleep(10);
     }
 }
 
-// Функция для рисования треугольного луча радара
-void DrawRadarBeam(HDC hdc, int centerX, int centerY, float angle, float length) {
-    const float beamWidthRad = BEAM_WIDTH_DEG * 3.14159265f / 180.0f;
-    const float angleRad = angle * 3.14159265f / 180.0f;
-
-    // Рассчитываем точки треугольника
-    POINT beamPoints[3];
-
-    // Вершина треугольника (центр радара)
-    beamPoints[0] = { centerX, centerY };
-
-    // Левая точка на окружности
-    beamPoints[1] = {
-        centerX + static_cast<int>(length * cos(angleRad - beamWidthRad / 2)),
-        centerY - static_cast<int>(length * sin(angleRad - beamWidthRad / 2))
+void DrawRadarBeam(HDC hdc, int center_x, int center_y, float angle, float length) {
+    float rad = angle * 3.14159265f / 180.0f;
+    float half_beam = BEAM_WIDTH * 3.14159265f / 360.0f;
+    
+    POINT points[3] = {
+        {center_x, center_y},
+        {center_x + static_cast<int>(length * cos(rad - half_beam)), 
+         center_y - static_cast<int>(length * sin(rad - half_beam))},
+        {center_x + static_cast<int>(length * cos(rad + half_beam)), 
+         center_y - static_cast<int>(length * sin(rad + half_beam))}
     };
-
-    // Правая точка на окружности
-    beamPoints[2] = {
-        centerX + static_cast<int>(length * cos(angleRad + beamWidthRad / 2)),
-        centerY - static_cast<int>(length * sin(angleRad + beamWidthRad / 2))
-    };
-
-    // Создаем кисть для заливки луча
-    HBRUSH hBeamBrush = CreateSolidBrush(BEAM_FILL);
-    HPEN hBeamPen = CreatePen(PS_SOLID, 1, RADAR_BEAM);
-
-    // Сохраняем старые объекты
-    HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hBeamBrush);
-    HPEN hOldPen = (HPEN)SelectObject(hdc, hBeamPen);
-
-    // Рисуем и заливаем треугольник
-    Polygon(hdc, beamPoints, 3);
-
-    // Восстанавливаем контекст
-    SelectObject(hdc, hOldBrush);
-    SelectObject(hdc, hOldPen);
-
-    // Удаляем созданные объекты
-    DeleteObject(hBeamBrush);
-    DeleteObject(hBeamPen);
+    
+    HBRUSH brush = CreateSolidBrush(BEAM_COLOR);
+    HPEN pen = CreatePen(PS_SOLID, 1, BEAM_COLOR);
+    HGDIOBJ old_brush = SelectObject(hdc, brush);
+    HGDIOBJ old_pen = SelectObject(hdc, pen);
+    
+    Polygon(hdc, points, 3);
+    
+    SelectObject(hdc, old_brush);
+    SelectObject(hdc, old_pen);
+    DeleteObject(brush);
+    DeleteObject(pen);
 }
 
 void DrawScene(HDC hdc) {
-    int centerX = WINDOW_WIDTH / 2;
-    int centerY = WINDOW_HEIGHT / 2;
-
-    RECT clientRect;
-    GetClientRect(WindowFromDC(hdc), &clientRect);
-
-    // Заливка темным фоном
-    HBRUSH hDarkBrush = CreateSolidBrush(DARK_BG);
-    FillRect(hdc, &clientRect, hDarkBrush);
-    DeleteObject(hDarkBrush);
-
-    // Рисование квадрата (пусковые установки)
-    HPEN hSquarePen = CreatePen(PS_SOLID, 2, SQUARE_COLOR);
-    HPEN hOldPen = (HPEN)SelectObject(hdc, hSquarePen);
-    MoveToEx(hdc, centerX + static_cast<int>(P), centerY + static_cast<int>(P), NULL);
-    LineTo(hdc, centerX + static_cast<int>(P), centerY - static_cast<int>(P));
-    LineTo(hdc, centerX - static_cast<int>(P), centerY - static_cast<int>(P));
-    LineTo(hdc, centerX - static_cast<int>(P), centerY + static_cast<int>(P));
-    LineTo(hdc, centerX + static_cast<int>(P), centerY + static_cast<int>(P));
-    SelectObject(hdc, hOldPen);
-    DeleteObject(hSquarePen);
-
-    // Зона обнаружения (синий)
-    HPEN hDetectionPen = CreatePen(PS_DASH, 1, DETECTION_COLOR);
-    SelectObject(hdc, hDetectionPen);
-    SelectObject(hdc, GetStockObject(NULL_BRUSH));
-    Ellipse(hdc,
-        centerX - static_cast<int>(DETECTION_RADIUS),
-        centerY - static_cast<int>(DETECTION_RADIUS),
-        centerX + static_cast<int>(DETECTION_RADIUS),
-        centerY + static_cast<int>(DETECTION_RADIUS));
-
-    // Зона поражения (красная)
-    HPEN hDestructionPen = CreatePen(PS_DASH, 1, DESTRUCTION_COLOR);
-    SelectObject(hdc, hDestructionPen);
-    Ellipse(hdc,
-        centerX - static_cast<int>(DESTRUCTION_RADIUS),
-        centerY - static_cast<int>(DESTRUCTION_RADIUS),
-        centerX + static_cast<int>(DESTRUCTION_RADIUS),
-        centerY + static_cast<int>(DESTRUCTION_RADIUS));
-
-    SelectObject(hdc, hOldPen);
-    DeleteObject(hDetectionPen);
-    DeleteObject(hDestructionPen);
-
-    // Луч радара (треугольный)
+    int center_x = WINDOW_WIDTH / 2;
+    int center_y = WINDOW_HEIGHT / 2;
+    RECT client_rect;
+    GetClientRect(WindowFromDC(hdc), &client_rect);
+    
+    // Фон
+    HBRUSH bg_brush = CreateSolidBrush(BG_COLOR);
+    FillRect(hdc, &client_rect, bg_brush);
+    DeleteObject(bg_brush);
+    
+    // Защитная зона
+    HPEN border_pen = CreatePen(PS_SOLID, 2, SQUARE_COLOR);
+    HGDIOBJ old_pen = SelectObject(hdc, border_pen);
+    MoveToEx(hdc, center_x + FIELD_SIZE, center_y + FIELD_SIZE, NULL);
+    LineTo(hdc, center_x + FIELD_SIZE, center_y - FIELD_SIZE);
+    LineTo(hdc, center_x - FIELD_SIZE, center_y - FIELD_SIZE);
+    LineTo(hdc, center_x - FIELD_SIZE, center_y + FIELD_SIZE);
+    LineTo(hdc, center_x + FIELD_SIZE, center_y + FIELD_SIZE);
+    SelectObject(hdc, old_pen);
+    DeleteObject(border_pen);
+    
+    // Зоны обнаружения и поражения
+    HPEN dashed_pen = CreatePen(PS_DASH, 1, DETECTION_COLOR);
+    SelectObject(hdc, dashed_pen);
+    HGDIOBJ old_brush = SelectObject(hdc, GetStockObject(NULL_BRUSH));
+    Ellipse(hdc, center_x - DETECTION_RADIUS, center_y - DETECTION_RADIUS, 
+            center_x + DETECTION_RADIUS, center_y + DETECTION_RADIUS);
+    DeleteObject(dashed_pen);
+    
+    dashed_pen = CreatePen(PS_DASH, 1, DESTRUCTION_COLOR);
+    SelectObject(hdc, dashed_pen);
+    Ellipse(hdc, center_x - DESTRUCTION_RADIUS, center_y - DESTRUCTION_RADIUS, 
+            center_x + DESTRUCTION_RADIUS, center_y + DESTRUCTION_RADIUS);
+    SelectObject(hdc, old_brush);
+    DeleteObject(dashed_pen);
+    
+    // Луч радара
     if (!radar.destroyed) {
-        DrawRadarBeam(hdc, centerX, centerY, radar.currentAngle, DETECTION_RADIUS);
+        DrawRadarBeam(hdc, center_x, center_y, radar.angle, DETECTION_RADIUS);
     }
-
+    
     // Ракеты
     for (const auto& missile : missiles) {
-        int posX = centerX + static_cast<int>(missile.x);
-        int posY = centerY - static_cast<int>(missile.y);
-
-        COLORREF color = MISSILE_NORMAL;
-        if (missile.detected) color = MISSILE_DETECTED;
-        if (missile.destroyed) color = MISSILE_DESTROYED;
-
-        HBRUSH hMissileBrush = CreateSolidBrush(color);
-        HPEN hMissilePen = CreatePen(PS_SOLID, 1, color);
-        HPEN hOldPen = (HPEN)SelectObject(hdc, hMissilePen);
-        HBRUSH hOldBrush = (HBRUSH)SelectObject(hdc, hMissileBrush);
-
-        Ellipse(hdc, posX - 5, posY - 5, posX + 5, posY + 5);
-
-        SelectObject(hdc, hOldPen);
-        SelectObject(hdc, hOldBrush);
-        DeleteObject(hMissileBrush);
-        DeleteObject(hMissilePen);
+        int x = center_x + static_cast<int>(missile.x);
+        int y = center_y - static_cast<int>(missile.y);
+        
+        COLORREF color = missile.detected ? 
+            (missile.destroyed ? DESTROYED_MISSILE_COLOR : DETECTED_MISSILE_COLOR) : 
+            MISSILE_COLOR;
+        
+        HBRUSH missile_brush = CreateSolidBrush(color);
+        HGDIOBJ old_brush = SelectObject(hdc, missile_brush);
+        Ellipse(hdc, x - 5, y - 5, x + 5, y + 5);
+        SelectObject(hdc, old_brush);
+        DeleteObject(missile_brush);
     }
-
-    // Статус радара
-    RECT statusRect = { 10, 10, 400, 120 };
-    SetTextColor(hdc, LIGHT_TEXT);
+    
+    // Статус
+    SetTextColor(hdc, TEXT_COLOR);
     SetBkMode(hdc, TRANSPARENT);
-
-    std::wstring status = radar.destroyed ?
-        L"РАДАР УНИЧТОЖЕН!\n" :
-        L"Статус: Работает\n";
-
-    status += L"Сбито ракет: " + std::to_wstring(destroyedCount) +
-        L"\nПрорвалось: " + std::to_wstring(hitCount) +
-        L"\nОсталось ракет: " + std::to_wstring(TOTAL_MISSILES - destroyedCount - hitCount) +
-        L"\nЗапущено: " + std::to_wstring(totalLaunched) + L"/" + std::to_wstring(TOTAL_MISSILES);
-
-    DrawText(hdc, status.c_str(), -1, &statusRect, DT_LEFT);
-
-    // Информация о луче
-    RECT beamRect = { 10, WINDOW_HEIGHT - 80, 400, WINDOW_HEIGHT - 10 };
-    std::wstring beamInfo = L"Ширина луча: " + std::to_wstring(static_cast<int>(BEAM_WIDTH_DEG)) +
-        L"°\nДальность: " + std::to_wstring(static_cast<int>(DETECTION_RADIUS)) +
-        L" пикселей";
-    DrawText(hdc, beamInfo.c_str(), -1, &beamRect, DT_LEFT);
-
-    // Крупный счетчик сбитых ракет
-    if (destroyedCount > 0) {
-        RECT countRect;
-        countRect.left = centerX - 100;
-        countRect.top = centerY - 50;
-        countRect.right = centerX + 100;
-        countRect.bottom = centerY + 50;
-
-        SetBkMode(hdc, TRANSPARENT);
-
-        HFONT hFont = CreateFont(60, 0, 0, 0, FW_BOLD, FALSE, FALSE, FALSE,
-            DEFAULT_CHARSET, OUT_OUTLINE_PRECIS,
-            CLIP_DEFAULT_PRECIS, CLEARTYPE_QUALITY,
-            VARIABLE_PITCH, TEXT("Arial"));
-        HFONT hOldFont = (HFONT)SelectObject(hdc, hFont);
-
-        SetTextColor(hdc, RGB(100, 255, 100));
-
-        std::wstring countText = L"Сбито: " + std::to_wstring(destroyedCount);
-        DrawText(hdc, countText.c_str(), -1, &countRect, DT_CENTER | DT_VCENTER | DT_SINGLELINE);
-
-        SelectObject(hdc, hOldFont);
-        DeleteObject(hFont);
+    RECT status_rect = { 20, 20, 400, 100 };
+    std::wstring status_text = radar.destroyed ? L"РАДАР УНИЧТОЖЕН!\n" : L"Статус: Работает\n";
+    status_text += L"Сбито: " + std::to_wstring(destroyed_count) + 
+                   L" Прорвалось: " + std::to_wstring(hit_count);
+    DrawText(hdc, status_text.c_str(), -1, &status_rect, DT_LEFT);
+    
+    // Счетчик сбитых ракет
+    if (destroyed_count > 0) {
+        RECT counter_rect = { center_x - 100, center_y - 50, center_x + 100, center_y + 50 };
+        HFONT big_font = CreateFont(60, 0, 0, 0, FW_BOLD, 0, 0, 0, 0, 0, 0, 0, 0, L"Arial");
+        HGDIOBJ old_font = SelectObject(hdc, big_font);
+        SetTextColor(hdc, BEAM_COLOR);
+        std::wstring counter_text = L"Сбито: " + std::to_wstring(destroyed_count);
+        DrawText(hdc, counter_text.c_str(), -1, &counter_rect, DT_CENTER | DT_VCENTER);
+        SelectObject(hdc, old_font);
+        DeleteObject(big_font);
     }
 }
 
-LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
-    switch (message) {
-    case WM_CREATE: {
-        srand(static_cast<unsigned>(time(nullptr)));
-
-        // Распределение 10 ракет по 4 установкам: 3, 3, 2, 2
-        launchers.emplace_back(P, P, 3);
-        launchers.emplace_back(P, -P, 3);
-        launchers.emplace_back(-P, -P, 2);
-        launchers.emplace_back(-P, P, 2);
-
-        std::thread(SimulationThread, hWnd).detach();
-        std::thread(RadarThread).detach();
+LRESULT CALLBACK WindowProc(HWND hwnd, UINT msg, WPARAM wparam, LPARAM lparam) {
+    switch (msg) {
+    case WM_CREATE:
+        {
+            std::random_device rd;
+            rng.seed(rd());
+            
+            // Случайное положение пусковых установок
+            std::uniform_real_distribution<float> pos_offset(-50.0f, 50.0f);
+            
+            launchers.emplace_back(FIELD_SIZE + pos_offset(rng), FIELD_SIZE + pos_offset(rng), 3);
+            launchers.emplace_back(FIELD_SIZE + pos_offset(rng), -FIELD_SIZE + pos_offset(rng), 3);
+            launchers.emplace_back(-FIELD_SIZE + pos_offset(rng), -FIELD_SIZE + pos_offset(rng), 2);
+            launchers.emplace_back(-FIELD_SIZE + pos_offset(rng), FIELD_SIZE + pos_offset(rng), 2);
+            
+            std::thread(SimulationThread, hwnd).detach();
+            std::thread(RadarThread).detach();
+        }
         break;
-    }
-
-    case WM_PAINT: {
-        PAINTSTRUCT ps;
-        HDC hdc = BeginPaint(hWnd, &ps);
-        DrawScene(hdc);
-        EndPaint(hWnd, &ps);
+        
+    case WM_PAINT:
+        {
+            PAINTSTRUCT ps;
+            HDC hdc = BeginPaint(hwnd, &ps);
+            DrawScene(hdc);
+            EndPaint(hwnd, &ps);
+        }
         break;
-    }
-
+        
     case WM_DESTROY:
-        simulationRunning = false;
+        is_running = false;
         PostQuitMessage(0);
         break;
-
+        
     default:
-        return DefWindowProc(hWnd, message, wParam, lParam);
+        return DefWindowProc(hwnd, msg, wparam, lparam);
     }
     return 0;
 }
 
-int WINAPI wWinMain(
-    _In_ HINSTANCE hInstance,
-    _In_opt_ HINSTANCE hPrevInstance,
-    _In_ LPWSTR lpCmdLine,
-    _In_ int nCmdShow) {
-
-    WNDCLASSEX wc = {
-        sizeof(WNDCLASSEX),
-        CS_HREDRAW | CS_VREDRAW,
-        WndProc,
-        0,
-        0,
-        hInstance,
-        NULL,
-        LoadCursor(NULL, IDC_ARROW),
-        (HBRUSH)CreateSolidBrush(DARK_BG),
-        NULL,
-        L"RadarWindowClass",
-        NULL
-    };
-
-    if (!RegisterClassEx(&wc)) {
-        return 0;
-    }
-
+int WINAPI wWinMain(HINSTANCE hInstance, HINSTANCE, LPWSTR, int cmd_show) {
+    WNDCLASSEX wc = { sizeof(WNDCLASSEX) };
+    wc.style = CS_HREDRAW | CS_VREDRAW;
+    wc.lpfnWndProc = WindowProc;
+    wc.hInstance = hInstance;
+    wc.hCursor = LoadCursor(NULL, IDC_ARROW);
+    wc.hbrBackground = (HBRUSH)CreateSolidBrush(BG_COLOR);
+    wc.lpszClassName = L"RadarDefense";
+    
+    RegisterClassEx(&wc);
+    
     // Центрирование окна
-    int screenWidth = GetSystemMetrics(SM_CXSCREEN);
-    int screenHeight = GetSystemMetrics(SM_CYSCREEN);
-    int windowX = (screenWidth - WINDOW_WIDTH) / 2;
-    int windowY = (screenHeight - WINDOW_HEIGHT) / 2;
-
-    HWND hWnd = CreateWindow(
-        wc.lpszClassName,
-        L"Система ПВО - 10 Ракет",
-        WS_OVERLAPPEDWINDOW,
-        windowX,
-        windowY,
-        WINDOW_WIDTH,
-        WINDOW_HEIGHT,
-        NULL,
-        NULL,
-        hInstance,
-        NULL
-    );
-
-    if (!hWnd) {
-        return 0;
-    }
-
-    ShowWindow(hWnd, nCmdShow);
-    UpdateWindow(hWnd);
-
+    int screen_width = GetSystemMetrics(SM_CXSCREEN);
+    int screen_height = GetSystemMetrics(SM_CYSCREEN);
+    int window_x = (screen_width - WINDOW_WIDTH) / 2;
+    int window_y = (screen_height - WINDOW_HEIGHT) / 2;
+    
+    HWND hwnd = CreateWindow(wc.lpszClassName, L"Система ПВО", WS_OVERLAPPEDWINDOW,
+                             window_x, window_y, WINDOW_WIDTH, WINDOW_HEIGHT, 
+                             NULL, NULL, hInstance, NULL);
+    
+    ShowWindow(hwnd, cmd_show);
+    UpdateWindow(hwnd);
+    
     MSG msg;
     while (GetMessage(&msg, NULL, 0, 0)) {
         TranslateMessage(&msg);
         DispatchMessage(&msg);
     }
-
-    return (int)msg.wParam;
+    
+    return static_cast<int>(msg.wParam);
 }
